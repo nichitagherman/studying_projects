@@ -1,0 +1,12 @@
+name: report_shavaleeva_german
+title: report_shavaleeva_german
+username:
+account: ngerman
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 817379
+bundleId: 1967653
+url: https://ngerman.shinyapps.io/report_shavaleeva_german/
+when: 1553676062.04944
+asMultiple: FALSE
+asStatic: FALSE

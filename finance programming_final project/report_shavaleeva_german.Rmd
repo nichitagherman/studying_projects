@@ -1,0 +1,542 @@
+---
+title: "Home Assignment Report. Topic 2"
+author: "Natalia Shavaleeva and Nikita German"
+date: "27 03 2019"
+output: 
+  html_document:
+    code_folding: "hide"
+
+runtime: shiny
+---
+
+Download all packages:
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+library(PerformanceAnalytics)
+library(xml2)
+library(rvest)
+library(zoo)
+library(tidyverse)
+library(rugarch)
+library(lubridate)
+library(parallel)
+library(shiny)
+```
+
+Extract data from Jan 2017 till March 2019 on 1000 cryptocurrencies with the highest market cap:
+```{r, eval=FALSE}
+# First extract their ids to supply them next in bitcoinFinance extractor
+main_website <- xml2::read_html(paste("https://coinmarketcap.com/all/views/all/"))
+all_ids <- html_nodes(main_website, "table") %>% html_nodes("tr") %>% 
+  html_attr("id") %>% map_chr(., ~ substr(., start = 4, stop = nchar(.)))
+# Now extract data from 01/01/2017 till 03/24/2019 using extract_function
+extract_function <- function(currency_name){
+  # Control for possible freezes of the website by making function sleep for 20 seconds if it fails to connect
+  # to the website
+  while(T){
+    tryCatch({
+      print("Wait...")
+      return(download_coinmarketcap_daily(cryptoname = currency_name, 
+                                          start_date=20170101, end_date=20190324))
+    }, error = function(error_message) {
+      Sys.sleep(20)})
+  }
+}
+# Parallelize data collection process. Collect the extracted data in `results``
+results <- mclapply(all_ids[2:1001], extract_function, mc.cores = 4)
+# Convert extracted data in tibble object `all_data`
+all_data <- tibble(currency_name = all_ids[2:1001], raw_data = results) %>% 
+  mutate(data = map(raw_data, ~ zoo(as.vector(.[, "Close**"]), order.by = mdy(.[, "Date"])))) %>%
+  select(-raw_data)
+```
+
+Transform initial series: calculate log- and net- returns. Do not consider in subsequent analysis series which start after May 2018 as they will not have enough data to properly perform backtesting procedure, especially for portfolios. This leaves us with 614 series:
+```{r, eval=FALSE}
+# Convert zoo series in xts 
+all_data <- all_data %>% mutate(data = map(data, ~ as.xts(., by.order = index(.))))
+
+# Add in all_data columns for log-returns and net-returns
+fun_log <- function(x){
+  CalculateReturns(as.xts(x %>% unlist(), by.order = index(x)),
+                   method = "log")
+}
+fun_net <- function(x){
+  CalculateReturns(as.xts(x %>% unlist(), by.order = index(x)),
+                   method = "simple")
+}
+
+all_data <- all_data %>% mutate(log_ret = map(data, fun_log),
+                                net_ret = map(data, fun_net))
+# Drop the first observations from series as there are NAs in returns
+all_data <- all_data %>% mutate(data = map(data, ~ .[-1, ]),
+                                log_ret = map(log_ret, ~ .[-1, ]),
+                                net_ret = map(net_ret, ~ .[-1, ]))
+# From original sample of coins select only the series which start at least from May 2018
+# to have the proper number of points for backtesting
+all_data <- all_data %>% filter(map_int(data, ~ start(.) < ymd("2018-05-01")) %>% as.logical())
+```
+
+For each of 614 series choose the best ARFIMA-GARCH model using BIC criteria. The model for each series is selected based on the first 250 observations as only for these observations we do not predict VaR and ES in our follow-up rolling forecast exercise. We consider the following candidate models: ARFIMA(0, 0)-GARCH(1, 1); ARFIMA(1, 0)-GARCH(1, 1); ARFIMA(1, 1)-GARCH(1, 0) --- all with skewed student distribution of the errors:
+```{r, eval=FALSE}
+# Write down the function which takes as arguments series for which best model is selected
+# and candidate specifications and returns the specification with the smallest BIC
+select_model <- function(series, specs){
+  bic_val <- c()
+  # Fit GARCH model for each specification supplied
+  for (spec in specs){
+    fit <- ugarchfit(spec=spec, data=series, solver="hybrid")
+    # Save model's BIC value. Handle the cases when the fit does not converge
+    # Assign for these cases large BIC as to not select these specifications
+    bic_val <- tryCatch({
+      c(bic_val, infocriteria(fit)[2])
+    }, error = function(error_message) {
+      c(bic_val, 100500)})
+  }
+  # Select the model with the smallest BIC in case not all models fail to converge
+  if (min(bic_val) != 100500){
+    return(specs[[which.min(bic_val)]])
+  }
+  # If all models failed to converge, select ARIMA(0, 0) - GARCH(1, 1) model
+  else{
+    return(specs[[1]])
+  }
+}
+
+# Put candidate models in `specs` object:
+spec1 <- ugarchspec(variance.model = list(garchOrder=c(1,1)),
+                    mean.model = list(armaOrder=c(0,0), arfima = TRUE),
+                    distribution.model = "sstd")
+spec2 <- ugarchspec(variance.model = list(garchOrder=c(1,1)),
+                    mean.model = list(armaOrder=c(1,0), arfima = TRUE),
+                    distribution.model = "sstd")
+spec3 <- ugarchspec(variance.model = list(garchOrder=c(1,0)),
+                    mean.model = list(armaOrder=c(1,1), arfima = TRUE),
+                    distribution.model = "sstd")
+specs <- list(spec1, spec2, spec3)
+
+# Create new columns in all_data with the ugarchspec suggested by select_model function
+spec_log_ret <- mclapply((all_data %>% transmute(log_ret = map(log_ret, ~ .[1:250])))$log_ret,
+                         select_model, specs = specs, mc.cores = 4)
+spec_net_ret <- mclapply((all_data %>% transmute(net_ret = map(net_ret, ~ .[1:250])))$net_ret,
+                         select_model, specs = specs, mc.cores = 4)
+all_data <- all_data %>% mutate(spec_log_ret = spec_log_ret, spec_net_ret = spec_net_ret)
+```
+
+Calculate the density of 1-step ahead forecasts using the models' specifications selected on the previous step. Our rolling estimation procedure uses moving window. Forecasts are build for all observations starting form the observation #250. The models are refitted each 20 observations:
+```{r, eval=FALSE}
+# Create a function which takes as arguments selected in the previous step specification
+# and series. It returns data frame with the main density characteristics of the forecasts
+density_forecast <- function(series, spec){
+  # Refit model each 5 periods. Use moving window
+  model <- ugarchroll(spec, series, n.ahead = 1, n.start = 250,
+                      window.size = 250, refit.every = 20, refit.window = "moving",
+                      solver = "hybrid")
+  return(as.data.frame(model, which = 'density'))
+  
+}
+# Create new columns fd in all_data
+fd_log_ret <- mcmapply(density_forecast, all_data$log_ret, all_data$spec_log_ret,
+                       SIMPLIFY = FALSE, USE.NAMES = FALSE, mc.cores = 4)
+fd_net_ret <- mcmapply(density_forecast, all_data$net_ret, all_data$spec_net_ret,
+                       SIMPLIFY = FALSE, USE.NAMES = FALSE, mc.cores = 4)
+all_data <- all_data %>% mutate(fd_log_ret = fd_log_ret, fd_net_ret = fd_net_ret)
+```
+
+Use the calculated density of forecasts to compute VaR and ES for different $\alpha$: 0.01, 0.02, 0.03, 0.04, 0.05:
+```{r, eval=FALSE}
+# Create function which takes as an argument the output of density_forecast function and alpha 
+# and returns VaR, ES and results of VaR and ES tests
+# Code was taken from http://www.unstarched.net/r-examples/rugarch/a-short-introduction-to-the-rugarch-package/
+metrics <- function(fd, alpha){
+  # Calculate VaR
+  VAR <- fd[, 'Mu'] + qdist('sstd', alpha, 0, 1, skew = fd[, 'Skew'],
+                            shape = fd[, 'Shape']) * fd[, 'Sigma']
+  
+  # Perform tests on VaR model validity. Sometimes there are no observations which are smaller
+  # then VaR threshold. In this case VaR test returns error. Capture these cases
+  VT1 <- tryCatch({
+    VaRTest(alpha, VaR = VAR, actual = fd[, "Realized"])$cc.Decision
+  }, error = function(error_message) {
+    return(NA)})
+  VT2 <- tryCatch({
+    VaRTest(alpha, VaR = VAR, actual = fd[, "Realized"])$uc.Decision
+  }, error = function(error_message) {
+    return(NA)})
+  
+  # Function to calculate ES given supplied fd
+  ES_function <- function(x){
+    f <- function(x, skew, shape) qdist('sstd', p = x, mu = 0, sigma = 1, skew = skew, shape = shape)
+    tryCatch({
+      return(x['Mu'] + x['Sigma'] * integrate(f, 0, alpha, skew = x['Skew'], shape = x['Shape'])$value)
+    }, error = function(error_message) {
+      return(NA)})
+  }
+  ES <- apply(fd, 1, ES_function)
+  # One series returns several NAs in ES.
+  # Fill NA values in it with mean ES on observations before first NA
+  if (sum(is.na(ES)) > 0){
+    ES[is.na(ES)] <- ES[1:(which(is.na(ES) == TRUE)[1]-1)] %>% mean()
+  }
+  
+  # Perform tests on ES model validity
+  ET <- ESTest(alpha = alpha, actual = fd[, "Realized"], ES = ES, VaR = VAR)$Decision
+  result <- list()
+  result[[1]] <- xts(VAR, order.by = fd %>% rownames() %>% ymd())
+  result[[2]] <- VT1
+  result[[3]] <- VT2
+  result[[4]] <- xts(ES, order.by = fd %>% rownames() %>% ymd())
+  result[[5]] <- ET
+  return(result)
+}
+
+# Create new columns in data for each alpha
+# alpha = 0.01
+all_data <- all_data %>% mutate(result_log_ret_alpha1 = map(fd_log_ret, metrics, 0.01),
+                                log_ret_var_alpha1 = map(result_log_ret_alpha1, ~.[[1]]),
+                                log_ret_vt1_alpha1 = map_chr(result_log_ret_alpha1, ~.[[2]]),
+                                log_ret_vt2_alpha1 = map_chr(result_log_ret_alpha1, ~.[[3]]),
+                                log_ret_es_alpha1 = map(result_log_ret_alpha1, ~.[[4]]),
+                                log_ret_et_alpha1 = map_chr(result_log_ret_alpha1, ~.[[5]]),
+                                
+                                result_net_ret_alpha1 = map(fd_net_ret, metrics, 0.01),
+                                net_ret_var_alpha1 = map(result_net_ret_alpha1, ~.[[1]]),
+                                net_ret_vt1_alpha1 = map_chr(result_net_ret_alpha1, ~.[[2]]),
+                                net_ret_vt2_alpha1 = map_chr(result_net_ret_alpha1, ~.[[3]]),
+                                net_ret_es_alpha1 = map(result_net_ret_alpha1, ~.[[4]]),
+                                net_ret_et_alpha1 = map_chr(result_net_ret_alpha1, ~.[[5]])) %>%
+  select(-result_log_ret_alpha1, -result_net_ret_alpha1)
+
+# alpha = 0.02
+all_data <- all_data %>% mutate(result_log_ret_alpha2 = map(fd_log_ret, metrics, 0.02),
+                                log_ret_var_alpha2 = map(result_log_ret_alpha2, ~.[[1]]),
+                                log_ret_vt1_alpha2 = map_chr(result_log_ret_alpha2, ~.[[2]]),
+                                log_ret_vt2_alpha2 = map_chr(result_log_ret_alpha2, ~.[[3]]),
+                                log_ret_es_alpha2 = map(result_log_ret_alpha2, ~.[[4]]),
+                                log_ret_et_alpha2 = map_chr(result_log_ret_alpha2, ~.[[5]]),
+                                
+                                result_net_ret_alpha2 = map(fd_net_ret, metrics, 0.02),
+                                net_ret_var_alpha2 = map(result_net_ret_alpha2, ~.[[1]]),
+                                net_ret_vt1_alpha2 = map_chr(result_net_ret_alpha2, ~.[[2]]),
+                                net_ret_vt2_alpha2 = map_chr(result_net_ret_alpha2, ~.[[3]]),
+                                net_ret_es_alpha2 = map(result_net_ret_alpha2, ~.[[4]]),
+                                net_ret_et_alpha2 = map_chr(result_net_ret_alpha2, ~.[[5]])) %>% 
+  select(-result_log_ret_alpha2, -result_net_ret_alpha2)
+
+# alpha = 0.03
+all_data <- all_data %>% mutate(result_log_ret_alpha3 = map(fd_log_ret, metrics, 0.03),
+                                log_ret_var_alpha3 = map(result_log_ret_alpha3, ~.[[1]]),
+                                log_ret_vt1_alpha3 = map_chr(result_log_ret_alpha3, ~.[[2]]),
+                                log_ret_vt2_alpha3 = map_chr(result_log_ret_alpha3, ~.[[3]]),
+                                log_ret_es_alpha3 = map(result_log_ret_alpha3, ~.[[4]]),
+                                log_ret_et_alpha3 = map_chr(result_log_ret_alpha3, ~.[[5]]),
+                                
+                                result_net_ret_alpha3 = map(fd_net_ret, metrics, 0.03),
+                                net_ret_var_alpha3 = map(result_net_ret_alpha3, ~.[[1]]),
+                                net_ret_vt1_alpha3 = map_chr(result_net_ret_alpha3, ~.[[2]]),
+                                net_ret_vt2_alpha3 = map_chr(result_net_ret_alpha3, ~.[[3]]),
+                                net_ret_es_alpha3 = map(result_net_ret_alpha3, ~.[[4]]),
+                                net_ret_et_alpha3 = map_chr(result_net_ret_alpha3, ~.[[5]])) %>% 
+  select(-result_log_ret_alpha3, -result_net_ret_alpha3)
+
+# alpha = 0.04
+all_data <- all_data %>% mutate(result_log_ret_alpha4 = map(fd_log_ret, metrics, 0.04),
+                                log_ret_var_alpha4 = map(result_log_ret_alpha4, ~.[[1]]),
+                                log_ret_vt1_alpha4 = map_chr(result_log_ret_alpha4, ~.[[2]]),
+                                log_ret_vt2_alpha4 = map_chr(result_log_ret_alpha4, ~.[[3]]),
+                                log_ret_es_alpha4 = map(result_log_ret_alpha4, ~.[[4]]),
+                                log_ret_et_alpha4 = map_chr(result_log_ret_alpha4, ~.[[5]]),
+                                
+                                result_net_ret_alpha4 = map(fd_net_ret, metrics, 0.04),
+                                net_ret_var_alpha4 = map(result_net_ret_alpha4, ~.[[1]]),
+                                net_ret_vt1_alpha4 = map_chr(result_net_ret_alpha4, ~.[[2]]),
+                                net_ret_vt2_alpha4 = map_chr(result_net_ret_alpha4, ~.[[3]]),
+                                net_ret_es_alpha4 = map(result_net_ret_alpha4, ~.[[4]]),
+                                net_ret_et_alpha4 = map_chr(result_net_ret_alpha4, ~.[[5]])) %>% 
+  select(-result_log_ret_alpha4, -result_net_ret_alpha4)
+
+# alpha = 0.05
+all_data <- all_data %>% mutate(result_log_ret_alpha5 = map(fd_log_ret, metrics, 0.05),
+                                log_ret_var_alpha5 = map(result_log_ret_alpha5, ~.[[1]]),
+                                log_ret_vt1_alpha5 = map_chr(result_log_ret_alpha5, ~.[[2]]),
+                                log_ret_vt2_alpha5 = map_chr(result_log_ret_alpha5, ~.[[3]]),
+                                log_ret_es_alpha5 = map(result_log_ret_alpha5, ~.[[4]]),
+                                log_ret_et_alpha5 = map_chr(result_log_ret_alpha5, ~.[[5]]),
+                                
+                                result_net_ret_alpha5 = map(fd_net_ret, metrics, 0.05),
+                                net_ret_var_alpha5 = map(result_net_ret_alpha5, ~.[[1]]),
+                                net_ret_vt1_alpha5 = map_chr(result_net_ret_alpha5, ~.[[2]]),
+                                net_ret_vt2_alpha5 = map_chr(result_net_ret_alpha5, ~.[[3]]),
+                                net_ret_es_alpha5 = map(result_net_ret_alpha5, ~.[[4]]),
+                                net_ret_et_alpha5 = map_chr(result_net_ret_alpha5, ~.[[5]])) %>% 
+  select(-result_log_ret_alpha5, -result_net_ret_alpha5)
+```
+
+Finally, extract characteristics of equally-weighted portfolio. We consider the following portfolios: portfolios comprised of 100, 200, 300, 400, 500, 600 coins with the largest cap. We investigate portfolio dynamics starting from May 2018 (recall this was the threshold we have chosen to throw away all coins which do not have observations by this date). VaR and ES for portfolio are calculated starting from Jan 2019. We also do not consider in our portfolio several coins which have too many missing values throughout the period May 2018-Mar 2019 as they significantly reduce the number of time points for which portfolio returns figures are available. For example, for portfolio comprised of 100 coins we do not consider 2 coins: Mixin and Moac.
+```{r, eval=FALSE}
+# Write function which takes as an argument all_data and n_coins - number of coins in portfolio
+# and returns tibble object with the same columns as in all_data but for constructed portfolio
+portfolio_results <- function(all_data, n_coins){
+  # Index_coins determines the index of coins to xbe used in the porfolio
+  index_coins <- seq(1, n_coins)
+  # The average of the following columns values will define portfolio characteristics:
+  cols_portfolio1 <- c("log_ret", "net_ret")
+  cols_portfolio2 <- c("log_ret_var_alpha1", "log_ret_es_alpha1",
+                       "net_ret_var_alpha1", "net_ret_es_alpha1", "log_ret_var_alpha2", 
+                       "log_ret_es_alpha2", "net_ret_var_alpha2", "net_ret_es_alpha2",
+                       "log_ret_var_alpha3", "log_ret_es_alpha3", "net_ret_var_alpha3",
+                       "net_ret_es_alpha3", "log_ret_var_alpha4", "log_ret_es_alpha4",
+                       "net_ret_var_alpha4", "net_ret_es_alpha4", "log_ret_var_alpha5",
+                       "log_ret_es_alpha5", "net_ret_var_alpha5", "net_ret_es_alpha5")
+  
+  # First let's considered the list of coins entering portfolio. Several coins have
+  # many missing values in the middle of the sample, establish these coins' indices
+  throw_index_coins <- c()
+  for (col in cols_portfolio1){
+    all_series <- c()
+    for (index_coin in index_coins){
+      # We will consider portfolio's behaviour starting from 2018-05-01
+      series <- window(all_data[index_coin, col][[1]][[1]], start = ymd("2018-05-01"))
+      all_series <- cbind(all_series, series)
+    }
+    # If the candidate coin has more than 3 missing values in returns, 
+    # we will not include it in portfolio
+    throw_index_coins <- c(throw_index_coins, index_coins[colSums(is.na(all_series)) > 3])
+  }
+  throw_index_coins <- throw_index_coins %>% unique()
+  index_coins <- index_coins[-throw_index_coins]
+  
+  # Use info about selected coins to get returns of selected portfolio
+  # Store portfolio characteristics in `portfolio`
+  portfolio <- list()
+  for (col in cols_portfolio1){
+    # We will consider portfolio's behaviour starting from 2018-05-01
+    all_series <- c()
+    for (index_coin in index_coins){
+      series <- window(all_data[index_coin, col][[1]][[1]], start = ymd("2018-05-01"))
+      all_series <- cbind(all_series, series)
+    }
+    # Throw away all time periods for which at least one series has missing value
+    all_series <- all_series[!is.na(rowSums(all_series)), ]
+    portfolio[[col]] <- xts(rowMeans(all_series), order.by = index(all_series)) %>% as.list()
+  }
+  
+  # Extract the dates when the info about portfolio returns is available
+  all_dates_portfolio <- portfolio[["log_ret"]][[1]] %>% index()
+  
+  # Extract the dates for which VaRs and ES are calculated following our backtesting procedure:
+  # That is we have to throw away first 250 time periods in `all_dates_portfolio`
+  all_dates_backtest <- all_dates_portfolio[250:length(all_dates_portfolio)]
+  
+  # Extract mean VaRs and ES for the dates in all_dates_backtest. Save results in portfolio object
+  for (col in cols_portfolio2){
+    # We will consider portfolio's behaviour starting from 2018-05-01
+    all_series <- c()
+    for (index_coin in index_coins){
+      series <- all_data[index_coin, col][[1]][[1]][all_dates_backtest]
+      all_series <- cbind(all_series, series)
+    }
+    portfolio[[col]] <- xts(rowMeans(all_series), order.by = index(all_series)) %>% as.list()
+  }
+  
+  # Perform tests for VaRs and ES. Save results in portfolio object
+  for (ret in c("net_ret", "log_ret")){
+    for (alpha in c("1", "2", "3", "4", "5")){
+      portfolio[[paste0(ret, "_vt1_alpha", alpha)]] <- tryCatch({
+        VaRTest(
+          as.numeric(alpha)/100, VaR = portfolio[[paste0(ret, "_var_alpha", alpha)]][[1]],
+          actual = portfolio[[ret]][[1]][all_dates_backtest])$cc.Decision
+      }, error = function(error_message) {
+        return(NA)})
+      
+      portfolio[[paste0(ret, "_vt2_alpha", alpha)]] <- tryCatch({
+        VaRTest(
+          as.numeric(alpha)/100, VaR = portfolio[[paste0(ret, "_var_alpha", alpha)]][[1]],
+          actual = portfolio[[ret]][[1]][all_dates_backtest])$uc.Decision
+      }, error = function(error_message) {
+        return(NA)})
+      
+      portfolio[[paste0(ret, "_et_alpha", alpha)]] <- tryCatch({
+        ESTest(
+          as.numeric(alpha)/100, actual = portfolio[[ret]][[1]][all_dates_backtest], 
+          VaR = portfolio[[paste0(ret, "_var_alpha", alpha)]][[1]],
+          ES = portfolio[[paste0(ret, "_es_alpha", alpha)]][[1]])$Decision
+      }, error = function(error_message) {
+        return(NA)})
+    }
+  }
+  # In order to concatenate successfully portfolio object with all_data add some more
+  # columns in portfolio with NA values
+  portfolio[["currency_name"]] <- paste0("portfolio", n_coins)
+  portfolio[["data"]] <- NA
+  portfolio[["spec_log_ret"]] <- NA
+  portfolio[["spec_net_ret"]] <- NA
+  portfolio[["fd_log_ret"]] <- NA
+  portfolio[["fd_net_ret"]] <- NA
+  return(as.tibble(portfolio))
+}
+
+# estimate results for portfolio with n_coins = 600
+all_data <- rbind(portfolio_results(all_data = all_data, n_coins = 600), all_data)
+# estimate results for portfolio with n_coins = 500
+all_data <- rbind(portfolio_results(all_data = all_data, n_coins = 500), all_data)
+# estimate results for portfolio with n_coins = 400
+all_data <- rbind(portfolio_results(all_data = all_data, n_coins = 400), all_data)
+# estimate results for portfolio with n_coins = 300
+all_data <- rbind(portfolio_results(all_data = all_data, n_coins = 300), all_data)
+# estimate results for portfolio with n_coins = 200
+all_data <- rbind(portfolio_results(all_data = all_data, n_coins = 200), all_data)
+# estimate results for portfolio with n_coins = 100
+all_data <- rbind(portfolio_results(all_data = all_data, n_coins = 100), all_data)
+
+# Save resulting dataset in `all_data_final.RData`
+saveRDS(all_data, file = "all_data_final.RData")
+```
+
+Provide the final results using the following application. User can choose currency of interest (notice that Portfolio100, Portfolio200, etc. represent portfolios with the respective number of coins comprising them). He can specify which model either log- or net-returns to consider, and $\alpha$ value for VaR and ES. The plot returns the actual dynamics of selected series starting from Jan 2017 and VaR's dynamics. Below the plot we summarize the results of our backtesting exercise: conclusions at 5% significance level are provided for unconditional and conditional coverage VaR tests and for McNeil and Frey ES test.
+```{r}
+# Attach dataset resulting from the previous steps:
+all_data <- readRDS("all_data_final.RData")
+
+# Transform currency id to get true currency names
+# First let all currency-names start with the upper-case
+all_data <- all_data %>%
+  mutate(currency_name = map_chr(currency_name, ~ paste(toupper(substr(., 1, 1)),
+                                                        substr(., 2, nchar(.)), sep="")))
+# Change "-" by " " in currency name
+all_data <- all_data %>%
+  mutate(currency_name = map_chr(currency_name, ~ gsub(., pattern = "-", replacement = " ")))
+
+# Create some objects for proper UI specification:
+choices_alpha <- list()
+choices_alpha[["0.01"]] <- "1"
+choices_alpha[["0.02"]] <- "2"
+choices_alpha[["0.03"]] <- "3"
+choices_alpha[["0.04"]] <- "4"
+choices_alpha[["0.05"]] <- "5"
+choices_ret <- list()
+choices_ret[["Log-return"]] <- "log_ret"
+choices_ret[["Net-return"]] <- "net_ret"
+
+# UI
+ui = fluidPage(
+  
+  titlePanel("Results"
+             ),
+  
+  sidebarLayout(
+    
+    # Input(s)
+    sidebarPanel(
+      
+      # Select coin
+      selectInput(inputId = "currency", 
+                  label = "Select currency for report:",
+                  choices = all_data$currency_name, 
+                  selected = "Bitcoin"),
+      
+      # Select type of model
+      selectInput(inputId = "ret", 
+                  label = "Select type of model: Log-return or Net-return:",
+                  choices = choices_ret, 
+                  selected = "log_ret"),
+      
+      # Select alpha for VaR and ES
+      selectInput(inputId = "alpha", 
+                  label = "Select alpha for VaR and ES:",
+                  choices = choices_alpha, 
+                  selected = "5")
+    ),
+    
+    # Outputs
+    mainPanel(
+      # Plot
+      plotOutput(outputId = "plot"),
+      # Test results
+      textOutput(outputId = "tests")
+    )
+  )
+)
+
+# Server
+server = function(input, output) {
+  
+  # Create scatterplot object the plotOutput function is expecting
+  output$plot <- renderPlot({
+    original_series <- (all_data %>% filter(currency_name == input$currency) %>%
+                          select(input$ret))[[1]][[1]]
+    # Extract VaR from the input given by user
+    var <- (all_data %>% filter(currency_name == input$currency) %>%
+              select(paste0(input$ret, "_var_alpha", input$alpha)))[[1]][[1]]
+    # Combine returns series and var in one tibble object plot_series
+    plot_series <- cbind(original_series, var)
+    plot_series <- cbind(index(plot_series), plot_series %>% as.tibble()) %>% as.tibble()
+    # Add to plot_series new column viol - which is equal to NA if actual return is larger than var
+    # and equal to actual value in the opposite case
+    colnames(plot_series) <- c("dates", "actual_val", "var")
+    plot_series <- plot_series %>% mutate(viol = ifelse(actual_val < var, actual_val, NA))
+    if (sum(!is.na(plot_series$viol) > 0)){
+      plot_series %>% ggplot() + geom_line(aes(x = dates, y = actual_val, col = "Actual Dynamics")) +
+        geom_line(aes(x = dates, y = var, col = "VaR")) +
+        geom_point(aes(x = dates, y = viol, col = "Violation points"), size = 2) +
+        theme_classic() +
+        theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+              legend.title = element_blank(), plot.title = element_text(size = 16, hjust = 0.5),
+              axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12),
+              legend.text = element_text(size = 12)) + 
+        labs(title = paste0("Model for ", input$currency)) +
+        scale_x_date(date_labels = "%b %Y")
+    }
+    else{
+      plot_series %>% ggplot() + geom_line(aes(x = dates, y = actual_val, col = "Actual Dynamics")) +
+        geom_line(aes(x = dates, y = var, col = "VaR")) +
+        theme_classic() +
+        theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+              legend.title = element_blank(), plot.title = element_text(size = 16, hjust = 0.5),
+              axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12),
+              legend.text = element_text(size = 12)) + 
+        labs(title = paste0("Model for ", input$currency)) +
+        scale_x_date(date_labels = "%b %Y")
+    }
+  })
+  
+  # Create text output stating the correlation between the two ploted 
+  output$tests <- renderText({
+    
+    
+    # Extract UC VaR test result
+    cc_vt <- (all_data %>% filter(currency_name == input$currency) %>%
+              select(paste0(input$ret, "_vt1_alpha", input$alpha)))[[1]]
+    uc_vt <- (all_data %>% filter(currency_name == input$currency) %>%
+              select(paste0(input$ret, "_vt2_alpha", input$alpha)))[[1]]
+    et <- (all_data %>% filter(currency_name == input$currency) %>%
+              select(paste0(input$ret, "_et_alpha", input$alpha)))[[1]]
+    if ((cc_vt == "Reject H0") | (is.na(cc_vt) == TRUE)){
+      cc_vt <- "misspecified"
+    }
+    else if (cc_vt == "Fail to Reject H0"){
+      cc_vt <- "correcty specified"
+    }
+    
+    if ((uc_vt == "Reject H0") | (is.na(uc_vt) == TRUE)){
+      uc_vt <- "misspecified"
+    }
+    else if (uc_vt == "Fail to Reject H0"){
+      uc_vt <- "correcty specified"
+    }
+    
+    if ((et == "Reject H0") | (is.na(et) == TRUE)){
+      et <- "misspecified"
+    }
+    else if (et == "Fail to Reject H0"){
+      et <- "correcty specified"
+    }
+    paste0("Test results: UC VaR test suggests that the selected model is ", uc_vt,
+           "; CC VaR test suggests that the model is ", cc_vt,
+           "; ES test suggests that the model is ", et, ".")
+  })
+}
+
+# Create a Shiny app object
+shinyApp(ui = ui, server = server, options = list(height = 550))
+```
+
+Notice bad backtesting results for portfolios: that is mostly due to the fact that the models have failed to approximate the shift in returns dynamics in 2019. The majority of models overestimate the risk in returns dynamics in 2019.

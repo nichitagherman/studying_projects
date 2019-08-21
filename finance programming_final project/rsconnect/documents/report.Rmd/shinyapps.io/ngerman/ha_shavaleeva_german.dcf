@@ -1,0 +1,12 @@
+name: ha_shavaleeva_german
+title: ha_shavaleeva_german
+username:
+account: ngerman
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 817353
+bundleId: 1967563
+url: https://ngerman.shinyapps.io/ha_shavaleeva_german/
+when: 1553672397.07667
+asMultiple: FALSE
+asStatic: FALSE
